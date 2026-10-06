@@ -12,6 +12,7 @@ from auth import get_current_user
 from models import User, Project, RenderJob
 from services.vertex_veo import submit_veo_generation, poll_veo_operation
 from services.billing import require_sufficient_credits, refund_credits, RENDER_PRICE_CENTS
+from services.ratelimit import check_render_rate_limit, check_render_concurrency
 
 logger = logging.getLogger("vbb.render")
 router = APIRouter(prefix="/api/projects", tags=["render"])
@@ -54,6 +55,19 @@ def start_render(
     segments = prompts_data["prompts"]
     if tier not in RENDER_PRICE_CENTS:
         raise HTTPException(status_code=400, detail="Invalid tier. Use 'standard' or 'pro'.")
+
+    # Abuse guards. Deliberately BEFORE any credit reservation so a throttled
+    # request never needs a refund — each render costs real GCP money.
+    check_render_rate_limit(user.id)
+    open_jobs = (
+        db.query(RenderJob)
+        .filter(
+            RenderJob.user_id == user.id,
+            RenderJob.status.in_(["pending", "running"]),
+        )
+        .count()
+    )
+    check_render_concurrency(open_jobs, user.id)
 
     # Reserve credits for the whole ad up front
     require_sufficient_credits(user.id, tier, db)

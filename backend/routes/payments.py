@@ -20,8 +20,9 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from models.credit import CreditBalance
-from models import User
+from models import User, ProcessedStripeSession
 from auth import get_current_user
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger("vbb.payments")
 router = APIRouter(prefix="/api/payments", tags=["payments"])
@@ -221,6 +222,34 @@ async def _handle_checkout_completed(session: dict, db: Session):
         logger.warning(
             "Checkout session %s has payment_status=%s, not crediting",
             session.get("id"), payment_status,
+        )
+        return
+
+    # Idempotency guard. Stripe retries deliveries — on timeout, on non-2xx, and
+    # when someone hits "Resend" in the dashboard — so the same completed session
+    # can arrive more than once. Crediting on every delivery would hand out the
+    # purchase amount repeatedly. The unique primary key on session_id makes this
+    # insert itself the lock: first delivery wins, later ones hit the constraint
+    # and are skipped.
+    session_id = session.get("id")
+    if not session_id:
+        logger.error("Completed session has no id — refusing to credit")
+        return
+
+    try:
+        db.add(
+            ProcessedStripeSession(
+                session_id=session_id,
+                user_id=user_id_str,
+                amount_cents=amount_cents,
+            )
+        )
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        logger.info(
+            "Duplicate delivery for session %s — already credited, skipping",
+            session_id,
         )
         return
 

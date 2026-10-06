@@ -55,6 +55,27 @@ class Project(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class ProcessedStripeSession(Base):
+    """Idempotency ledger for Stripe webhook fulfillment.
+
+    Stripe retries webhook deliveries (on timeouts, non-2xx, or manual resend),
+    and the same `checkout.session.completed` event can arrive more than once.
+    Without a record of what we have already credited, each duplicate delivery
+    silently adds the purchase amount to the user's balance again — free
+    credits, real money.
+
+    The primary key on `session_id` makes the insert itself the lock: the first
+    delivery wins, every later delivery hits a unique violation and is skipped.
+    """
+
+    __tablename__ = "processed_stripe_sessions"
+
+    session_id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, nullable=True)
+    amount_cents = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class RenderJob(Base):
     __tablename__ = "render_jobs"
 

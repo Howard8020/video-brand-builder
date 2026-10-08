@@ -92,10 +92,11 @@ app.include_router(profile_router)
 app.include_router(payments_router)
 app.include_router(render_router)
 
-import os
-_generated_dir = os.path.join(os.path.dirname(__file__), "generated")
-os.makedirs(_generated_dir, exist_ok=True)
-app.mount("/generated", StaticFiles(directory=_generated_dir), name="generated")
+from services.storage import generated_dir
+
+_generated_dir = generated_dir()
+print(f"[startup] {os.path.basename(__file__)}: generated dir = {_generated_dir}")
+app.mount("/generated", StaticFiles(directory=str(_generated_dir)), name="generated")
 
 
 @app.get("/api/health")

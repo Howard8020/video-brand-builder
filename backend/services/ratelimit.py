@@ -10,8 +10,16 @@ acceptable here — the authoritative spend control is the credit balance
 runaway loop or a compromised account, where "resets on deploy" is fine.
 
 Tune with env vars:
-    VBB_RENDER_LIMIT_PER_HOUR   max render submissions per user per hour (default 5)
-    VBB_RENDER_MAX_CONCURRENT   max simultaneously open render jobs per user (default 3)
+    VBB_RENDER_LIMIT_PER_DAY    max render submissions per user per day (default 1)
+    VBB_RENDER_LIMIT_PER_HOUR   max render submissions per user per hour (default 2)
+    VBB_RENDER_MAX_CONCURRENT   max simultaneously open render jobs per user (default 12)
+
+Defaults target the current internal use: ONE 30-second ad per day (~$3 of Veo
+at $0.10/sec, ~$90/month). Per-hour is intentionally above per-day so a retry
+after a failure is possible without allowing a second ad. Max-concurrent is
+deliberately generous because it counts segment JOBS: a 30s ad is ~6 segments
+submitted at once, so a low ceiling would block a legitimate retry while the
+first ad is still rendering.
 """
 import os
 import threading
@@ -21,13 +29,32 @@ from typing import Dict, Deque
 
 from fastapi import HTTPException
 
-RENDER_LIMIT_PER_HOUR = int(os.getenv("VBB_RENDER_LIMIT_PER_HOUR", "5"))
-RENDER_MAX_CONCURRENT = int(os.getenv("VBB_RENDER_MAX_CONCURRENT", "3"))
+RENDER_LIMIT_PER_DAY = int(os.getenv("VBB_RENDER_LIMIT_PER_DAY", "1"))
+RENDER_LIMIT_PER_HOUR = int(os.getenv("VBB_RENDER_LIMIT_PER_HOUR", "2"))
+RENDER_MAX_CONCURRENT = int(os.getenv("VBB_RENDER_MAX_CONCURRENT", "12"))
 
 _WINDOW_SECONDS = 3600.0
 
 _lock = threading.Lock()
 _render_hits: Dict[str, Deque[float]] = defaultdict(deque)
+
+
+def check_render_daily_cap(ads_today: int, user_id: str) -> None:
+    """Raise 429 if this user has already started too many ads today.
+
+    `ads_today` is counted by the caller from the database (one row per
+    submission), NOT from in-process state — a counter in memory resets on
+    every redeploy, which would hand out a free extra render after each deploy.
+    The database count is the authoritative spend control.
+    """
+    if ads_today >= RENDER_LIMIT_PER_DAY:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Daily render limit reached: {RENDER_LIMIT_PER_DAY} ad(s) per day. "
+                "This limit bounds real Vertex AI spend; it resets at midnight UTC."
+            ),
+        )
 
 
 def check_render_rate_limit(user_id: str) -> None:

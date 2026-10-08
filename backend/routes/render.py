@@ -5,6 +5,8 @@ Credits are reserved up front, refunded on failure.
 """
 import os
 import logging
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import SessionLocal
@@ -12,13 +14,17 @@ from auth import get_current_user
 from models import User, Project, RenderJob
 from services.vertex_veo import submit_veo_generation, poll_veo_operation
 from services.billing import require_sufficient_credits, refund_credits, RENDER_PRICE_CENTS
-from services.ratelimit import check_render_rate_limit, check_render_concurrency
+from services.ratelimit import (
+    check_render_rate_limit,
+    check_render_concurrency,
+    check_render_daily_cap,
+)
+from services.storage import generated_dir
 
 logger = logging.getLogger("vbb.render")
 router = APIRouter(prefix="/api/projects", tags=["render"])
 
-GENERATED_DIR = os.path.join(os.path.dirname(__file__), "..", "generated")
-os.makedirs(GENERATED_DIR, exist_ok=True)
+GENERATED_DIR = generated_dir()
 
 
 def get_db():
@@ -61,6 +67,26 @@ def start_render(
     # Abuse guards. Deliberately BEFORE any credit reservation so a throttled
     # request never needs a refund — each render costs real GCP money.
     check_render_rate_limit(user.id)
+
+    # Daily cap, counted from the DATABASE rather than memory: an in-process
+    # counter resets on every redeploy, which would hand out a free render each
+    # time. Every submission writes exactly one job with segment_index == 0, so
+    # counting those counts ADS started today (not segments).
+    # Naive UTC to match the model's server_default across both SQLite and PG.
+    start_of_day = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+    )
+    ads_today = (
+        db.query(RenderJob)
+        .filter(
+            RenderJob.user_id == user.id,
+            RenderJob.segment_index == 0,
+            RenderJob.created_at >= start_of_day,
+        )
+        .count()
+    )
+    check_render_daily_cap(ads_today, user.id)
+
     open_jobs = (
         db.query(RenderJob)
         .filter(

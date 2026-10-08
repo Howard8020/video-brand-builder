@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { generateProject, reviseProject, approveScript, approveScenes, getProjectPrompts, refreshCaption, refreshHooks, lintProject, startRender, getRenderStatus, API_BASE } from "@/lib/api";
+import { generateProject, reviseProject, approveScript, approveScenes, getProjectPrompts, refreshCaption, refreshHooks, lintProject, startRender, getRenderStatus, API_BASE, assembleProject, getAssembledVideo, assembledPlaybackUrl, downloadAssembled } from "@/lib/api";
 
 interface Segment {
   name?: string;
@@ -75,11 +75,17 @@ export default function ProjectReview() {
   const [segmentRevising, setSegmentRevising] = useState<{ [key: number]: { instruction: string; busy: boolean } }>({});
 
   const [continuity, setContinuity] = useState<Record<string, string>>({});
-  const [renderTier, setRenderTier] = useState<"standard" | "pro">("standard");
+  const [renderTier, setRenderTier] = useState<"standard" | "pro">("pro");
   const [renderRunning, setRenderRunning] = useState(false);
   const [renderJobs, setRenderJobs] = useState<any[] | null>(null);
   const [renderStatus, setRenderStatus] = useState<any[] | null>(null);
   const [pollInterval, setPollInterval] = useState<ReturnType<typeof setInterval> | null>(null);
+
+  // ── Assembly: join the segments into one postable video ──
+  const [assembling, setAssembling] = useState(false);
+  const [assembled, setAssembled] = useState<any | null>(null);
+  const [assembleError, setAssembleError] = useState("");
+  const [downloading, setDownloading] = useState(false);
 
   async function load() {
     if (!token || !projectId) return;
@@ -92,6 +98,14 @@ export default function ProjectReview() {
       setContinuity((data.continuity || {}) as any);
       if (data.status === "approved" && data.prompts) {
         setPromptsReady(data.prompts);
+      }
+      // Surface an already-assembled video so the final file survives a reload
+      // instead of appearing to vanish.
+      try {
+        const asm = await getAssembledVideo(token, projectId);
+        if (asm?.assembled) setAssembled(asm);
+      } catch {
+        /* nothing assembled yet */
       }
     } catch {
       setError("Failed to load project");
@@ -263,6 +277,34 @@ export default function ProjectReview() {
     };
   }, [pollInterval]);
 
+  // Join the rendered segments into one platform-ready video.
+  async function onAssemble() {
+    if (!project || !token) return;
+    setAssembling(true);
+    setAssembleError("");
+    try {
+      const result = await assembleProject(token, project.id);
+      setAssembled(result);
+    } catch (e) {
+      setAssembleError(e instanceof Error ? e.message : "Assembly failed");
+    } finally {
+      setAssembling(false);
+    }
+  }
+
+  async function onDownload() {
+    if (!project || !token || !assembled) return;
+    setDownloading(true);
+    setAssembleError("");
+    try {
+      await downloadAssembled(token, project.id, assembled.filename);
+    } catch (e) {
+      setAssembleError(e instanceof Error ? e.message : "Download failed");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
   if (loading) {
     return <div className="mx-auto max-w-5xl px-4 py-10 text-sm text-gray-500">Loading project…</div>;
   }
@@ -276,6 +318,9 @@ export default function ProjectReview() {
   const segs = script.segments || [];
   const scenesList = (project.scenes && project.scenes.scenes) || [];
   const brief = project.brief || {};
+  const renderList = renderStatus || renderJobs || [];
+  const allSegmentsSucceeded =
+    renderList.length > 0 && renderList.every((j: any) => j.status === "succeeded");
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 space-y-6">
@@ -470,8 +515,8 @@ export default function ProjectReview() {
                 disabled={renderRunning}
                 className="rounded border border-gray-300 px-3 py-2 text-sm"
               >
-                <option value="standard">Standard — $9.99 (Veo 3.1 Fast 720p)</option>
-                <option value="pro">Pro — $29.99 (Veo 3.1 1080p)</option>
+                <option value="pro">1080×1920 — Veo 3.1 (recommended: TikTok / Facebook Reels)</option>
+                <option value="standard">720×1280 — Veo 3.1 Fast (faster, cheaper drafts)</option>
               </select>
               <button
                 disabled={renderRunning}
@@ -480,8 +525,10 @@ export default function ProjectReview() {
               >
                 {renderRunning ? "Rendering…" : "Render all segments"}
               </button>
-              <a href="/billing" className="text-xs text-[#0B1C3E] underline">Buy credits</a>
             </div>
+            <p className="mt-2 text-xs text-gray-500">
+              Rendered vertical 9:16 automatically — the format TikTok and Facebook Reels expect. The two options differ only in resolution.
+            </p>
 
             {/* Render status list */}
             {renderJobs && (
@@ -500,13 +547,62 @@ export default function ProjectReview() {
                        job.status === "running" ? "⏳ Generating…" : "⏳ Pending"}
                     </span>
                     {job.video_url && (
-                      <a href={job.video_url} target="_blank" rel="noopener noreferrer" className="text-[#0B1C3E] underline">View</a>
+                      <a href={`${API_BASE}${job.video_url}`} target="_blank" rel="noopener noreferrer" className="text-[#0B1C3E] underline">View</a>
                     )}
                   </div>
                 ))}
               </div>
             )}
           </div>
+
+          {/* Assemble → one postable video */}
+          {(allSegmentsSucceeded || assembled) && (
+            <div className="rounded border border-[#0B1C3E] p-4">
+              <h3 className="text-sm font-semibold">Finish the ad</h3>
+              <p className="mt-1 text-xs text-gray-500">
+                Joins every segment into a single video, in order, and levels the audio so the
+                volume doesn&apos;t jump between cuts. Output is MP4 / H.264 / AAC at 9:16 —
+                ready to upload to TikTok and Facebook Reels.
+              </p>
+
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <button
+                  disabled={assembling}
+                  onClick={onAssemble}
+                  className="min-h-11 rounded bg-[#0B1C3E] px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+                >
+                  {assembling ? "Joining clips…" : assembled ? "Rebuild final video" : "Assemble final video"}
+                </button>
+                {assembled && (
+                  <button
+                    disabled={downloading}
+                    onClick={onDownload}
+                    className="min-h-11 rounded border border-[#0B1C3E] px-4 py-2 text-sm font-medium text-[#0B1C3E] disabled:opacity-60"
+                  >
+                    {downloading ? "Preparing…" : "Download MP4"}
+                  </button>
+                )}
+              </div>
+
+              {assembleError && <p className="mt-2 text-xs text-red-600">{assembleError}</p>}
+
+              {assembled && (
+                <div className="mt-4 space-y-2">
+                  <video
+                    controls
+                    playsInline
+                    className="w-full max-w-xs rounded border border-gray-200 bg-black"
+                    src={assembledPlaybackUrl(assembled.url)}
+                  />
+                  <p className="text-xs text-gray-500">
+                    {assembled.filename} · {assembled.segment_count} segments ·{" "}
+                    {assembled.duration}s · {assembled.width}×{assembled.height}
+                    {assembled.has_audio ? " · with audio" : " · no audio track"}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
         </section>
       )}
     </div>

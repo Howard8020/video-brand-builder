@@ -152,6 +152,56 @@ export async function getRenderStatus(token: string, projectId: string) {
   });
 }
 
+// ── Assembly (join segments into one postable video) ──────────────
+
+export async function assembleProject(token: string, projectId: string) {
+  return request(`/api/projects/${projectId}/assemble`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function getAssembledVideo(token: string, projectId: string) {
+  return request(`/api/projects/${projectId}/assemble`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+/** Absolute URL for playback. The /assembled mount is public, so <video src>
+ *  does not need to carry the auth header. */
+export function assembledPlaybackUrl(relativeUrl: string) {
+  return `${API_BASE}${relativeUrl}`;
+}
+
+/** Download the assembled video.
+ *
+ * Fetched with the Authorization header and saved via a blob URL, because a
+ * plain <a href> cannot send the bearer token and would 401. */
+export async function downloadAssembled(token: string, projectId: string, filename: string) {
+  const res = await fetch(`${API_BASE}/api/projects/${projectId}/assemble/download`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    let detail = `Download failed (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data?.detail) detail = data.detail;
+    } catch {
+      /* keep default */
+    }
+    throw new Error(detail);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 // ── Billing / Credits ─────────────────────────────────────────────
 
 export async function getCreditBalance(token: string) {

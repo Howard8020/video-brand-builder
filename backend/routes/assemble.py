@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
@@ -149,3 +150,35 @@ def assembled_status(
         "size_bytes": existing.stat().st_size,
         **{k: v for k, v in probe(existing).items() if k in ("duration", "width", "height", "has_audio")},
     }
+
+
+@router.get("/{project_id}/assemble/download")
+def download_assembled(
+    project_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Serve the assembled video as a download.
+
+    A plain link to /assembled/<file> does not reliably download when the
+    frontend and API are on different origins — browsers ignore the `download`
+    attribute cross-origin and just navigate to the file. Sending
+    Content-Disposition: attachment from here makes it an actual download
+    regardless of where the page is served from.
+    """
+    proj = db.query(Project).filter(
+        Project.id == project_id, Project.user_id == user.id
+    ).first()
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    client_name = (proj.brief or {}).get("clientName") or ""
+    path = assembled_dir() / f"{_slug(client_name, 'ad')}-{project_id}.mp4"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No assembled video yet — assemble first")
+
+    return FileResponse(
+        str(path),
+        media_type="video/mp4",
+        filename=path.name,
+    )

@@ -80,6 +80,8 @@ def submit_veo_generation(
         number_of_videos=1,
         resolution=res,
         person_generation=_PERSON_GENERATION,
+        generate_audio=True,
+        negative_prompt="misspelled text, garbled letters, illegible words, distorted text, gibberish on screen",
     )
 
     op = client.models.generate_videos(

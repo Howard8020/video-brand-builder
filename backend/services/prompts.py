@@ -239,15 +239,38 @@ def revise_scene_prompt(p, idx, instruction):
     return 'You are revising ONE scene. The SCRIPT IS LOCKED. CONTINUITY IS FIXED.\n\\nOTHER SCENES:\\n{}\\n\\nSCENE TO REVISE (#{} — \\"{}\\", {}s):\\nLocked dialogue: \\"{}\\"\\nCurrent action: {} | camera: {} | on-screen text: {}\\n\\nCONTINUITY (fixed):\\n{}{}\\nINSTRUCTION: {}\\n\\nReturn ONLY valid JSON for the single revised scene: {{\\"action\\":\\"\\",\\"camera\\":\\"\\",\\"on_screen_text\\":\\"\\"}}'.format("\\n".join(others), idx+1, s.get("name"), s.get("duration"), s.get("spoken"), cur.get("action", "—"), cur.get("camera", "—"), cur.get("on_screen_text", "—"), cont_block(continuity), visual_mode_rules(p.get("visualMode") or "spokesperson"), instruction)
 
 
+def _simplify_on_screen_text(text):
+    """Veo 3.1 garbles long on-screen text and URLs.
+
+    Keep it to ≤ 3 short words with no punctuation complexity.  Strip URLs,
+    colons, and long phrases down to the bare minimum.  If it can't be
+    simplified to something a child could read at a glance, return "" — the
+    text can be burned in post with ffmpeg instead.
+    """
+    if not text:
+        return ""
+    # Strip URLs — Veo cannot render them legibly.
+    import re as _re
+    cleaned = _re.sub(r"https?://\S+", "", text).strip()
+    # Strip "Step N:" prefixes — the colon + number confuses the model.
+    cleaned = _re.sub(r"^Step\s*\d+\s*:\s*", "", cleaned, flags=_re.I).strip()
+    # Strip lone trailing fragments after a middot/pipe.
+    cleaned = _re.split(r"\s*[·|]\s*", cleaned)[0].strip()
+    words = cleaned.split()
+    if len(words) <= 3 and all(len(w) <= 12 for w in words):
+        return cleaned
+    # If it's a short sentence (≤ 5 words) with no digits/URLs, keep it.
+    if len(words) <= 5 and not any(c.isdigit() for c in cleaned) and "." not in cleaned:
+        return cleaned
+    return ""  # too complex — burn in post instead
+
+
 def assemble_flow_prompt(seg, i, project):
     brief = project.get("brief") or {}
     continuity = project.get("continuity") or {}
     mode = project.get("visualMode") or "spokesperson"
     delivery = continuity.get("delivery") or "warm, upbeat, and animated — never flat or monotone"
-    if mode == "product":
-        label = "Voiceover — exact words, no additions, performed " + delivery[0].lower() + delivery[1:]
-    else:
-        label = "Dialogue — exact words, no additions, performed " + delivery[0].lower() + delivery[1:]
+    spokesperson = continuity.get("spokesperson") or "a friendly presenter"
     action = seg.get("action") or seg.get("visual") or ""
     lines = []
     lines.append("SEGMENT {} — {}".format(i+1, seg.get("name", "")))
@@ -258,11 +281,23 @@ def assemble_flow_prompt(seg, i, project):
     lines.append("")
     lines.append("Camera: {}".format(seg.get("camera") or "—"))
     lines.append("")
-    lines.append("{}:".format(label))
-    lines.append('"{}"'.format(seg.get("spoken")))
-    if seg.get("on_screen_text"):
+    # Veo 3.1 generates audio natively when dialogue is clearly attributed
+    # and quoted.  Put the speaker + the exact line up front so the model
+    # "sees" the speech before the continuity clutter.
+    if mode == "product":
+        label = "Voiceover"
+    else:
+        label = "Dialogue"
+    spoken = seg.get("spoken") or ""
+    lines.append("{} — {} says, with {} delivery:".format(label, spokesperson.split(",")[0].strip(), delivery.split(",")[0].strip()))
+    lines.append('"{}"'.format(spoken))
+    lines.append("Generate clear, audible speech with synchronized lip movement matching this dialogue exactly.")
+    # On-screen text — simplified to very short phrases only.
+    raw_ost = seg.get("on_screen_text") or ""
+    ost = _simplify_on_screen_text(raw_ost)
+    if ost:
         lines.append("")
-        lines.append("On-screen text: {}".format(seg.get("on_screen_text")))
+        lines.append('On-screen text (render exactly, all caps): "{}"'.format(ost.upper()))
     cont_text = cont_block(continuity) or ("Lighting: {}".format(seg.get("lighting")) if seg.get("lighting") else "")
     lines.append("")
     lines.append("Continuity — identical in every segment of this ad:")

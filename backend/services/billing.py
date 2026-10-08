@@ -4,6 +4,8 @@ Ported from spotlight-contractor/backend/services/billing.py.
 Simplified: no daily_budget/campaign concept. Charges flat per render.
 """
 import logging
+import os
+
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
@@ -13,6 +15,24 @@ logger = logging.getLogger("vbb.billing")
 
 # Flat per-ad pricing (not per-second)
 RENDER_PRICE_CENTS = {"standard": 999, "pro": 2999}
+
+# Internal-use switch. Video Brand Builders is used in-house to produce our own
+# ad videos, so there is no customer to bill. With this on, the credit check and
+# the deduction are skipped entirely and the payment code is left intact but
+# dormant. Off by default: a missing or malformed value keeps the paid path.
+#
+#   VBB_RENDER_BYPASS_CREDITS=true  -> renders are not metered or charged
+#
+# NOTE: with the credit gate disabled, nothing else bounds GCP spend per
+# account other than the render rate limit (services/ratelimit.py). Keep that
+# limit set, and keep a GCP budget alert configured.
+_BYPASS_FLAG = "VBB_RENDER_BYPASS_CREDITS"
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def credits_bypassed() -> bool:
+    """True when rendering should run unmetered (internal production mode)."""
+    return os.getenv(_BYPASS_FLAG, "").strip().lower() in _TRUE_VALUES
 
 
 def get_or_create_credit_balance(user_id: str, db: Session) -> CreditBalance:
@@ -35,6 +55,10 @@ def require_sufficient_credits(user_id: str, tier: str, db: Session) -> None:
 
     Raises 402 HTTPException if insufficient.
     """
+    if credits_bypassed():
+        logger.info("Credit check bypassed (internal mode) — render not metered")
+        return
+
     required = RENDER_PRICE_CENTS.get(tier, RENDER_PRICE_CENTS["standard"])
     balance = get_or_create_credit_balance(user_id, db)
 
@@ -62,6 +86,10 @@ def require_sufficient_credits(user_id: str, tier: str, db: Session) -> None:
 
 def refund_credits(user_id: str, tier: str, db: Session) -> None:
     """Refund the tier price back to the user's balance (on render failure)."""
+    if credits_bypassed():
+        # Nothing was deducted, so there is nothing to give back.
+        return
+
     amount = RENDER_PRICE_CENTS.get(tier, RENDER_PRICE_CENTS["standard"])
     balance = get_or_create_credit_balance(user_id, db)
     balance.balance_cents += amount

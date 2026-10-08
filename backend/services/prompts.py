@@ -99,6 +99,22 @@ def clip_text(durations):
     return ", ".join(str(d) for d in durations[:-1]) + ", or " + str(durations[-1])
 
 
+def segment_count(runtime, durations):
+    """How many clips are needed to cover `runtime` seconds.
+
+    Veo only renders 4/6/8s clips, so a long ad MUST be split into more clips
+    than a short one. The previous hardcoded "3 if <=16 else 4" capped every ad
+    at 4 x 8s = 32s, which made a 40s runtime impossible to satisfy — the model
+    was asked to hit a target its own constraints forbade.
+
+    Keeps the old floor (so shorter ads are unchanged) and only raises the
+    count when the allowed clip lengths physically cannot reach the runtime.
+    """
+    longest = max(durations) if durations else 8
+    needed = -(-int(runtime) // int(longest))  # ceil division
+    return max(needed, 3 if runtime <= 16 else 4)
+
+
 def _schema():
     return 'Return ONLY valid JSON (no markdown, no commentary) with exactly this shape: {"brief":{"core_message":"1 sentence","emotional_appeal":"1 sentence","practical_benefit":"1 sentence","objection":"1 sentence","strategy_note":"1 sentence"},"title":"short ad title","segments":[{"name":"","purpose":"hook|benefit|example|cta","duration":4,"spoken":""}]}'
 
@@ -108,7 +124,7 @@ def gen_prompt(p):
     tpl = p.get("template") or {}
     durations = p.get("settings", {}).get("clipLengths") or [4, 6, 8]
     runtime = p.get("runtime") or 24
-    n_seg = 3 if runtime <= 16 else 4
+    n_seg = segment_count(runtime, durations)
     brief = p.get("brief") or {}
     lines = []
     lines.append("You are an expert short-form video ad scriptwriter creating a {} second ad.\n\nThis is the MESSAGE stage: write dialogue only. Scene treatments are directed later, after the script is locked.\n\nBRIEF:\n- Business: {} ({})\n- Video purpose: {}\n- Campaign goal: {}\n- Target audience: {}\n- Tone: {}\n- Offer: {}\n- Required call to action (verbatim in final segment): \"{}\"\n- Platform: {} ({})".format(runtime, brief.get("clientName"), brief.get("category"), brief.get("serviceLine"), brief.get("goal"), brief.get("audience"), ", ".join(p.get("tones", [])), brief.get("offer", "none specified"), brief.get("cta"), brief.get("platform"), brief.get("aspect")))
@@ -139,7 +155,7 @@ def adapt_prompt(p):
     durations = p.get("settings", {}).get("clipLengths") or [4, 6, 8]
     runtime = p.get("runtime") or 24
     brief = p.get("brief") or {}
-    n_seg = 3 if runtime <= 16 else 4
+    n_seg = segment_count(runtime, durations)
     src = p.get("sourceScript") or ""
     lines = []
     lines.append("You are an expert short-form video script editor. The client wrote this script themselves. Your job is to ADAPT it — not rewrite it — into a {} second segmented video script ready for AI video generation.\n\nCLIENT'S ORIGINAL SCRIPT:\n\"\"\"\n{}\n\"\"\"\n\nBRIEF:\n- Business: {} ({})\n- Video purpose: {}\n- Campaign goal: {}\n- Target audience: {}\n- Tone: {}\n- Platform: {} ({})".format(runtime, src, brief.get("clientName"), brief.get("category"), brief.get("serviceLine"), brief.get("goal"), brief.get("audience"), ", ".join(p.get("tones", [])), brief.get("platform"), brief.get("aspect")))

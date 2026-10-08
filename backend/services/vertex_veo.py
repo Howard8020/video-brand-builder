@@ -25,6 +25,20 @@ VEO_MODELS = {
     "pro": "veo-3.1-generate-001",
 }
 
+# 1080p output is a property of the model tier, not a separate switch: the Pro
+# model renders 1080p, Fast is 720p only. Previously NOTHING was passed to
+# GenerateVideosConfig.resolution, so every render silently came back 720p even
+# when the UI offered a "1080p" tier.
+TIER_RESOLUTION = {
+    "standard": "720p",
+    "pro": "1080p",
+}
+
+# Veo refuses clips containing people under the default ("allow_adult"), which
+# rejected any ad with children or a family. These ads are our own in-house
+# brand spots, so allow_all is the intended setting.
+_PERSON_GENERATION = "allow_all"
+
 # Cache the client so we don't re-auth on every call
 _client = None
 
@@ -53,15 +67,19 @@ def submit_veo_generation(
     duration_seconds: int,
     tier: str = "standard",
     aspect_ratio: str = "9:16",
+    resolution: str | None = None,
 ) -> str:
     """Submit a Veo generation request. Returns the long-running operation name."""
     client = _get_client()
     model_id = VEO_MODELS.get(tier, VEO_MODELS["standard"])
+    res = resolution or TIER_RESOLUTION.get(tier, "720p")
 
     config = genai_types.GenerateVideosConfig(
         aspect_ratio=aspect_ratio,
         duration_seconds=duration_seconds,
         number_of_videos=1,
+        resolution=res,
+        person_generation=_PERSON_GENERATION,
     )
 
     op = client.models.generate_videos(

@@ -89,6 +89,13 @@ class RenderDirectRequest(BaseModel):
     settings: dict = {}  # clipLengths, wpm, etc.
 
 
+class SegmentResult(BaseModel):
+    index: int  # 1-based segment number
+    name: str
+    status: str  # "succeeded" | "failed" | "pending" | "rendering"
+    error: Optional[str] = None
+
+
 class RenderDirectResponse(BaseModel):
     job_id: str
     status: str  # "queued" | "rendering" | "assembling" | "done" | "failed"
@@ -105,6 +112,7 @@ class RenderDirectStatus(BaseModel):
     segments_failed: int
     video_url: Optional[str] = None
     error: Optional[str] = None
+    segment_results: list[SegmentResult] = []
 
 
 # --- In-memory job store (single-worker, same pattern as ratelimit.py) ---
@@ -132,20 +140,40 @@ def _run_job(job_id: str, request: RenderDirectRequest, user_id: str):
         seg_paths = []
         failed = 0
 
+        # Initialize segment results with names
+        seg_results = []
         for i, seg in enumerate(segs, 1):
-            _set_status(job_id, "rendering", segment_index=i, segments_done=i - 1)
+            seg_results.append({
+                "index": i,
+                "name": seg.get("name", f"Segment {i}"),
+                "status": "pending",
+                "error": None,
+            })
+        _set_status(job_id, "rendering", segment_results=seg_results)
+
+        for i, seg in enumerate(segs, 1):
+            _set_status(job_id, "rendering", segments_done=i - 1)
+            _update_seg_result(job_id, i, "rendering")
+
             dest = gen_dir / f"rd_{job_id}_seg{i}.mp4"
-            result = _render_one_segment(seg, dest, tier, aspect, max_retries=2)
+            result = _render_one_segment(seg, dest, tier, aspect, max_retries=3)
+
             if result.get("ok"):
                 seg_paths.append(dest)
+                _update_seg_result(job_id, i, "succeeded")
             else:
+                err_msg = result.get("error", "unknown error")
                 failed += 1
-                logger.warning("render-direct %s seg %d failed: %s", job_id, i, result.get("error"))
+                _update_seg_result(job_id, i, "failed", error=err_msg)
+                logger.warning("render-direct %s seg %d (%s) failed: %s",
+                               job_id, i, seg.get("name", "?"), err_msg)
 
         if failed:
+            failed_names = [r["name"] for r in seg_results if r["status"] == "failed"]
             _set_status(job_id, "failed",
-                        error=f"{failed} of {len(segs)} segments failed",
-                        segments_failed=failed)
+                        error=f"{failed} of {len(segs)} segments failed: {', '.join(failed_names)}",
+                        segments_failed=failed,
+                        segment_results=seg_results)
             return
 
         # Assemble
@@ -158,30 +186,62 @@ def _run_job(job_id: str, request: RenderDirectRequest, user_id: str):
         video_url = f"/assembled/{out_name}"
         _set_status(job_id, "done",
                     video_url=video_url,
-                    segments_done=len(seg_paths))
+                    segments_done=len(seg_paths),
+                    segment_results=seg_results)
 
     except Exception as e:
         logger.error("render-direct %s failed: %s", job_id, e)
         _set_status(job_id, "failed", error=str(e))
 
 
+def _update_seg_result(job_id: str, seg_index: int, status: str, error: str | None = None):
+    """Update one segment's result in the job store (thread-safe)."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        results = job.get("segment_results", [])
+        for r in results:
+            if r["index"] == seg_index:
+                r["status"] = status
+                if error:
+                    r["error"] = error
+                break
+
+
 def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
-                         max_retries: int = 2) -> dict:
-    """Submit + poll one segment, with retries on transient failures."""
+                         max_retries: int = 3) -> dict:
+    """Submit + poll one segment, with retries on transient failures AND
+    safety-filter false positives.
+
+    Veo's safety filter (rai_media_filtered_count > 0) is inconsistent — the
+    same prompt may pass on a second or third attempt. We retry up to
+    max_retries times for both transient GCP errors (UNAVAILABLE, empty
+    responses) and safety filters, with an increasing delay between attempts.
+    """
     from google.genai.types import GenerateVideosOperation
     client = _get_client()
 
+    last_error = "unknown error"
+
     for attempt in range(max_retries + 1):
+        # Increasing delay between retries: 10s, 20s, 30s
+        if attempt > 0:
+            delay = 10 * attempt
+            logger.info("render-direct: retrying segment (attempt %d, waiting %ds)",
+                        attempt, delay)
+            time.sleep(delay)
+
         try:
             op_name = submit_veo_generation(
                 seg["prompt"], seg["duration"],
                 tier=tier, aspect_ratio=aspect,
             )
         except Exception as e:
+            last_error = f"submit failed: {e}"
             if attempt < max_retries:
-                time.sleep(10)
                 continue
-            return {"ok": False, "error": f"submit failed: {e}"}
+            return {"ok": False, "error": last_error}
 
         # Poll
         op = GenerateVideosOperation(name=op_name)
@@ -189,7 +249,8 @@ def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
         timeout = 600
         while True:
             if time.time() - start > timeout:
-                break
+                last_error = "poll timeout"
+                break  # retry
             try:
                 res = client.operations.get(op)
             except Exception:
@@ -197,17 +258,26 @@ def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
                 continue
             if res.done:
                 if res.error:
-                    # Transient errors are retried
                     err_str = str(res.error)
+                    last_error = err_str
+                    # Transient GCP errors — retry
                     if "UNAVAILABLE" in err_str or "code: 14" in err_str:
+                        break  # retry
+                    # Other errors — still try once more, may be transient
+                    if attempt < max_retries:
                         break  # retry
                     return {"ok": False, "error": err_str}
                 vids = getattr(res.response, "generated_videos", None) or []
                 if not vids:
-                    # Could be transient (empty response) or safety filter
+                    # Could be transient (empty response) or safety filter.
+                    # Veo's safety filters produce false positives — retry.
                     filtered = getattr(res.response, "rai_media_filtered_count", None)
                     if filtered and filtered > 0:
-                        return {"ok": False, "error": f"safety filter ({filtered} filtered)"}
+                        last_error = f"safety filter ({filtered} filtered — may be false positive, retrying)"
+                        logger.warning("render-direct: safety filter on attempt %d (%d filtered)",
+                                      attempt + 1, filtered)
+                        break  # retry — safety filters can be false positives
+                    last_error = "no generated videos in response"
                     break  # retry on empty
                 vid = vids[0].video
                 data = None
@@ -227,17 +297,13 @@ def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
                         import httpx
                         data = httpx.get(uri, timeout=300).content
                 if not data:
-                    return {"ok": False, "error": "no video data"}
+                    last_error = "no video data"
+                    break  # retry
                 dest.write_bytes(data)
                 return {"ok": True, "bytes": len(data)}
             time.sleep(8)
 
-        # Retry
-        if attempt < max_retries:
-            logger.info("render-direct: retrying segment (attempt %d)", attempt + 1)
-            time.sleep(10)
-
-    return {"ok": False, "error": "exhausted retries"}
+    return {"ok": False, "error": last_error}
 
 
 def _set_status(job_id: str, status: str, **kwargs):
@@ -261,9 +327,12 @@ def create_direct_render(
 
     The pipeline runs in a background thread:
     1. assemble_prompts() builds per-segment Veo prompts
-    2. Each segment is submitted to Vertex AI Veo with transient retries
+    2. Each segment is submitted to Vertex AI Veo with transient + safety retries
     3. Segments are assembled (stream-copy + loudnorm + faststart)
     4. The finished video URL is stored in the job record
+
+    Status response includes per-segment results (which clip succeeded/failed
+    and the error message) so callers can diagnose failures without server logs.
     """
     try:
         if not request.scenes:
@@ -281,7 +350,7 @@ def create_direct_render(
 
         # Rate limit
         check_render_rate_limit(user.id)
-        check_render_concurrency(0, user.id)  # check_render_concurrency checks open jobs
+        check_render_concurrency(0, user.id)
 
         # Check credits unless bypassed
         if not os.getenv(_BYPASS, "").lower() in ("true", "1"):
@@ -307,6 +376,16 @@ def create_direct_render(
     import uuid
     job_id = f"rd_{uuid.uuid4().hex[:12]}"
 
+    # Initialize segment results
+    seg_results = []
+    for i, s in enumerate(request.scenes, 1):
+        seg_results.append({
+            "index": i,
+            "name": s.name,
+            "status": "pending",
+            "error": None,
+        })
+
     with _jobs_lock:
         _jobs[job_id] = {
             "job_id": job_id,
@@ -318,6 +397,7 @@ def create_direct_render(
             "segments_failed": 0,
             "video_url": None,
             "error": None,
+            "segment_results": seg_results,
             "created_at": time.time(),
         }
 
@@ -342,13 +422,21 @@ def get_direct_render_status(
     job_id: str,
     user: User = Depends(get_current_user),
 ):
-    """Poll the status of a direct render job."""
+    """Poll the status of a direct render job.
+
+    Returns per-segment results showing which clip succeeded or failed and
+    the error message for each failure, so callers can diagnose issues
+    without access to server logs.
+    """
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["user_id"] != user.id:
         raise HTTPException(status_code=403, detail="Not your job")
+
+    seg_results = [SegmentResult(**r) for r in job.get("segment_results", [])]
+
     return RenderDirectStatus(
         job_id=job["job_id"],
         status=job["status"],
@@ -358,4 +446,5 @@ def get_direct_render_status(
         segments_failed=job["segments_failed"],
         video_url=job.get("video_url"),
         error=job.get("error"),
+        segment_results=seg_results,
     )

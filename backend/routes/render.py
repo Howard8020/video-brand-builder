@@ -48,11 +48,13 @@ def start_render(
             detail="Project must be fully approved (Gate 2 complete) before rendering",
         )
 
-    prompts_data = proj.prompts
-    if not prompts_data or not prompts_data.get("prompts"):
+    # NOTE: assemble_prompts() stores the list under "segments" (with "social"
+    # alongside it). This previously read "prompts", a key that is never set, so
+    # every render failed 400 "No prompts found" even after scenes were approved.
+    prompts_data = proj.prompts or {}
+    segments = prompts_data.get("segments") or []
+    if not segments:
         raise HTTPException(status_code=400, detail="No prompts found — approve scenes first")
-
-    segments = prompts_data["prompts"]
     if tier not in RENDER_PRICE_CENTS:
         raise HTTPException(status_code=400, detail="Invalid tier. Use 'standard' or 'pro'.")
 
@@ -74,7 +76,7 @@ def start_render(
 
     # Submit each segment to Veo
     jobs = []
-    for seg in segments:
+    for i, seg in enumerate(segments):
         duration = seg.get("duration", 6)
         prompt_text = seg.get("prompt", "")
         try:
@@ -82,7 +84,9 @@ def start_render(
             job = RenderJob(
                 project_id=project_id,
                 user_id=user.id,
-                segment_index=seg.get("segment_index", 0),
+                # Use the enumeration index: the stored field is "segment"
+                # (1-based), and reading "segment_index" left every job at 0.
+                segment_index=i,
                 tier=tier,
                 vertex_operation_name=op_name,
                 status="running",

@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from database import SessionLocal, init_db
-from routes import auth_router, clients_router, projects_router, albert_router, payments_router, render_router, assemble_router, profile_router
+from routes import auth_router, clients_router, projects_router, albert_router, payments_router, render_router, assemble_router, profile_router, render_direct_router
 from models import User, Client
 
 

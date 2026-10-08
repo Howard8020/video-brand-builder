@@ -92,6 +92,7 @@ app.include_router(profile_router)
 app.include_router(payments_router)
 app.include_router(render_router)
 app.include_router(assemble_router)
+app.include_router(render_direct_router)
 
 from services.storage import generated_dir, assembled_dir
 

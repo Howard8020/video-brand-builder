@@ -292,12 +292,9 @@ def assemble_flow_prompt(seg, i, project):
     lines.append("{} — {} says, with {} delivery:".format(label, spokesperson.split(",")[0].strip(), delivery.split(",")[0].strip()))
     lines.append('"{}"'.format(spoken))
     lines.append("Generate clear, audible speech with synchronized lip movement matching this dialogue exactly.")
-    # On-screen text — simplified to very short phrases only.
-    raw_ost = seg.get("on_screen_text") or ""
-    ost = _simplify_on_screen_text(raw_ost)
-    if ost:
-        lines.append("")
-        lines.append('On-screen text (render exactly, all caps): "{}"'.format(ost.upper()))
+    # On-screen text is NOT sent to Veo — it reliably garbles even short text.
+    # All on-screen text is burned in post with ffmpeg drawtext after assembly.
+    # The on_screen_text field is preserved in the segment data for the post step.
     cont_text = cont_block(continuity) or ("Lighting: {}".format(seg.get("lighting")) if seg.get("lighting") else "")
     lines.append("")
     lines.append("Continuity — identical in every segment of this ad:")

@@ -6,3 +6,4 @@ from routes.payments import router as payments_router
 from routes.render import router as render_router
 from routes.assemble import router as assemble_router
 from routes.profile import router as profile_router
+from routes.render_direct import router as render_direct_router

@@ -68,11 +68,27 @@ def submit_veo_generation(
     tier: str = "standard",
     aspect_ratio: str = "9:16",
     resolution: str | None = None,
+    reference_images: list[genai_types.Image] | None = None,
 ) -> str:
-    """Submit a Veo generation request. Returns the long-running operation name."""
+    """Submit a Veo generation request. Returns the long-running operation name.
+
+    If reference_images is provided, they are passed as "ingredients to video"
+    asset references so the model anchors character/product appearance to the
+    provided images rather than guessing from text alone.
+    """
     client = _get_client()
     model_id = VEO_MODELS.get(tier, VEO_MODELS["standard"])
     res = resolution or TIER_RESOLUTION.get(tier, "720p")
+
+    refs = None
+    if reference_images:
+        refs = [
+            genai_types.VideoGenerationReferenceImage(
+                image=img,
+                reference_type="asset",
+            )
+            for img in reference_images
+        ]
 
     config = genai_types.GenerateVideosConfig(
         aspect_ratio=aspect_ratio,
@@ -82,6 +98,7 @@ def submit_veo_generation(
         person_generation=_PERSON_GENERATION,
         generate_audio=True,
         negative_prompt="misspelled text, garbled letters, illegible words, distorted text, gibberish on screen",
+        reference_images=refs,
     )
 
     op = client.models.generate_videos(

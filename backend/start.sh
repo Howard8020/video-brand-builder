@@ -5,9 +5,21 @@ set -e
 # ── GCP credentials ──────────────────────────────────────────────
 # Railway doesn't have a file system for secrets. Store the credentials
 # JSON as the GCP_CREDENTIALS_JSON env var; we write it to disk at startup.
+#
+# Use printf '%s', NOT echo: this JSON contains backslash escapes inside
+# private_key, and some shells' echo interprets those, producing a file that
+# google.auth then rejects with "not a valid json file". Write it verbatim and
+# verify it parses, so a bad value is reported at boot instead of surfacing
+# later as an opaque 500 on the first render.
 if [ -n "$GCP_CREDENTIALS_JSON" ]; then
-  echo "$GCP_CREDENTIALS_JSON" > gcp-credentials.json
-  echo "GCP credentials written to disk"
+  printf '%s' "$GCP_CREDENTIALS_JSON" > gcp-credentials.json
+  if python -c "import json; json.load(open('gcp-credentials.json'))" 2>/dev/null; then
+    echo "GCP credentials written to disk (valid JSON)"
+  else
+    echo "ERROR: GCP_CREDENTIALS_JSON did not produce valid JSON — Veo rendering will fail"
+  fi
+else
+  echo "WARNING: GCP_CREDENTIALS_JSON is not set — Veo rendering will fail"
 fi
 
 # ── Database tables (idempotent) ─────────────────────────────────

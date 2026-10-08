@@ -1,0 +1,3 @@
+# nixpacks.toml — install ffmpeg for video assembly (stream-copy + loudnorm + drawtext)
+[phases.setup]
+nixPkgs = ["ffmpeg"]

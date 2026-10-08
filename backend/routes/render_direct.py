@@ -265,36 +265,44 @@ def create_direct_render(
     3. Segments are assembled (stream-copy + loudnorm + faststart)
     4. The finished video URL is stored in the job record
     """
-    if not request.scenes:
-        raise HTTPException(status_code=400, detail="At least one scene is required")
-    if request.tier not in ("standard", "pro"):
-        raise HTTPException(status_code=400, detail="tier must be 'standard' or 'pro'")
+    try:
+        if not request.scenes:
+            raise HTTPException(status_code=400, detail="At least one scene is required")
+        if request.tier not in ("standard", "pro"):
+            raise HTTPException(status_code=400, detail="tier must be 'standard' or 'pro'")
 
-    # Validate durations
-    for s in request.scenes:
-        if s.duration not in (4, 6, 8):
+        # Validate durations
+        for s in request.scenes:
+            if s.duration not in (4, 6, 8):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Scene '{s.name}' has duration {s.duration}s — must be 4, 6, or 8",
+                )
+
+        # Rate limit
+        check_render_rate_limit(user.id)
+        check_render_concurrency(0, user.id)  # check_render_concurrency checks open jobs
+
+        # Check credits unless bypassed
+        if not os.getenv(_BYPASS, "").lower() in ("true", "1"):
+            from services.billing import require_sufficient_credits
+            try:
+                require_sufficient_credits(user.id, request.tier, db)
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=402, detail=str(e))
+
+        if not ffmpeg_available():
             raise HTTPException(
-                status_code=400,
-                detail=f"Scene '{s.name}' has duration {s.duration}s — must be 4, 6, or 8",
+                status_code=500,
+                detail="ffmpeg is not available on this host — cannot assemble.",
             )
-
-    # Rate limit
-    check_render_rate_limit(user.id)
-    check_render_concurrency(0, user.id)  # check_render_concurrency checks open jobs
-
-    # Check credits unless bypassed
-    if not os.getenv(_BYPASS, "").lower() in ("true", "1"):
-        from services.billing import require_sufficient_credits
-        try:
-            require_sufficient_credits(user.id, request.tier, db)
-        except Exception as e:
-            raise HTTPException(status_code=402, detail=str(e))
-
-    if not ffmpeg_available():
-        raise HTTPException(
-            status_code=500,
-            detail="ffmpeg is not available on this host — cannot assemble.",
-        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("render-direct submission failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Submission failed: {e}")
 
     import uuid
     job_id = f"rd_{uuid.uuid4().hex[:12]}"

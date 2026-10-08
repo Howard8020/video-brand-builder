@@ -111,6 +111,52 @@ def probe(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _trim_segment(in_path: Path, out_path: Path, trim_start: float = 0.3,
+                   trim_end: float = 0.3) -> bool:
+    """Trim silence/freeze-frame from the start and end of a Veo clip.
+
+    Veo clips typically have ~0.3-0.5s of silence or a freeze-frame at the
+    beginning and end. Trimming these makes clip-to-clip transitions tighter
+    when the clips are concatenated.
+
+    Returns True on success, False if trimming failed (caller should use
+    the original untrimmed file as a fallback).
+    """
+    cmd = [
+        ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", str(trim_start),
+        "-i", str(in_path),
+        "-t", str(max(0.1, _probe_duration(in_path) - trim_start - trim_end)),
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    res = _run(cmd)
+    if res.returncode != 0:
+        logger.warning("trim failed for %s: %s", in_path.name,
+                        (res.stderr or "").strip()[:200])
+        return False
+    return True
+
+
+def _probe_duration(path: Path) -> float:
+    """Get the duration of a media file in seconds (best-effort)."""
+    try:
+        res = subprocess.run(
+            [ffprobe_bin(), "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+        if res.returncode == 0:
+            return float(res.stdout.strip())
+    except Exception:
+        pass
+    return 8.0  # fallback assumption
+
+
 def assemble(segment_paths: Sequence[Path], out_path: Path) -> Dict[str, Any]:
     """Concatenate `segment_paths` (in order) into `out_path`.
 
@@ -134,9 +180,24 @@ def assemble(segment_paths: Sequence[Path], out_path: Path) -> Dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="vbb_assemble_") as tmp:
+        # Trim silence/freeze-frame from clip boundaries for tighter transitions.
+        # Veo clips have ~0.3-0.5s of silence at the start and end; trimming
+        # makes the cut between clips feel snappy instead of laggy.
+        trimmed_paths = []
+        trim_failed = False
+        for p in segment_paths:
+            src = Path(p)
+            trimmed = Path(tmp) / f"trimmed_{src.name}"
+            if _trim_segment(src, trimmed, trim_start=0.3, trim_end=0.3):
+                trimmed_paths.append(trimmed)
+            else:
+                # Fallback: use the original untrimmed file
+                logger.warning("using untrimmed segment: %s", src.name)
+                trimmed_paths.append(src)
+
         list_file = Path(tmp) / "segments.txt"
         list_file.write_text(
-            "\n".join(_concat_list_line(Path(p).resolve()) for p in segment_paths) + "\n",
+            "\n".join(_concat_list_line(Path(p).resolve()) for p in trimmed_paths) + "\n",
             encoding="utf-8",
         )
 

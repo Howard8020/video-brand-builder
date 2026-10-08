@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from database import SessionLocal
 from auth import get_current_user
 from models import User
-from services.prompts import assemble_prompts
+from services.prompts import assemble_prompts, seg_cap
 from services.vertex_veo import submit_veo_generation, _get_client
 from services.assembly import assemble, ffmpeg_available
 from services.storage import assembled_dir, generated_dir
@@ -34,6 +34,52 @@ logger = logging.getLogger("vbb.render_direct")
 router = APIRouter(prefix="/api/render-direct", tags=["render-direct"])
 
 _BYPASS = "VBB_RENDER_BYPASS_CREDITS"
+
+# Reference image for character consistency. Loaded once and cached.
+# The Amy reference image was generated via FAL.ai and committed to the repo
+# at backend/assets/amy-apple-blossom-reference.png. Override with
+# VBB_REFERENCE_IMAGE env var for a custom path.
+_REF_IMAGE_PATH = os.getenv(
+    "VBB_REFERENCE_IMAGE",
+    str(Path(__file__).resolve().parent.parent / "assets" / "amy-apple-blossom-reference.png"),
+)
+_ref_image = None
+_ref_image_lock = threading.Lock()
+
+
+def _load_reference_image():
+    """Load and cache the spokesperson reference image for Veo.
+
+    Returns a genai_types.Image or None if no reference image is configured.
+    The image anchors the character's appearance across all independently
+    generated clips.
+    """
+    global _ref_image
+    if _ref_image is not None:
+        return _ref_image
+    if not _REF_IMAGE_PATH or not os.path.exists(_REF_IMAGE_PATH):
+        logger.info("No reference image configured (VBB_REFERENCE_IMAGE=%s)", _REF_IMAGE_PATH)
+        return None
+    try:
+        from PIL import Image as PILImage
+        import io
+        from google.genai import types as genai_types
+        img = PILImage.open(_REF_IMAGE_PATH)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        max_dim = 1024
+        if max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            img = img.resize((int(img.size[0] * ratio), int(img.size[1] * ratio)))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        with _ref_image_lock:
+            _ref_image = genai_types.Image(image_bytes=buf.getvalue(), mime_type="image/png")
+        logger.info("Loaded reference image: %s", _REF_IMAGE_PATH)
+        return _ref_image
+    except Exception as e:
+        logger.warning("Could not load reference image %s: %s", _REF_IMAGE_PATH, e)
+        return None
 
 
 def get_db():
@@ -151,12 +197,32 @@ def _run_job(job_id: str, request: RenderDirectRequest, user_id: str):
             })
         _set_status(job_id, "rendering", segment_results=seg_results)
 
+        # Load reference image for character consistency
+        ref_img = _load_reference_image()
+
+        wpm = settings.get("wpm", 125)
+
         for i, seg in enumerate(segs, 1):
             _set_status(job_id, "rendering", segments_done=i - 1)
             _update_seg_result(job_id, i, "rendering")
 
+            # Word-count check — warn if dialogue exceeds the per-clip cap.
+            # Veo stretches over-long dialogue to fit the duration, producing
+            # slow, awkward speech with pauses.
+            duration = seg.get("duration", 8)
+            cap = int(seg_cap(duration, wpm))
+            spoken = seg.get("spoken", "") or ""
+            word_count = len(spoken.split())
+            if word_count > cap:
+                logger.warning(
+                    "render-direct %s seg %d (%s): %d words in %ds clip (cap %d) — "
+                    "dialogue may sound slow or stretched",
+                    job_id, i, seg.get("name", "?"), word_count, duration, cap,
+                )
+
             dest = gen_dir / f"rd_{job_id}_seg{i}.mp4"
-            result = _render_one_segment(seg, dest, tier, aspect, max_retries=3)
+            result = _render_one_segment(seg, dest, tier, aspect, max_retries=3,
+                                          reference_image=ref_img)
 
             if result.get("ok"):
                 seg_paths.append(dest)
@@ -210,9 +276,13 @@ def _update_seg_result(job_id: str, seg_index: int, status: str, error: str | No
 
 
 def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
-                         max_retries: int = 3) -> dict:
+                         max_retries: int = 3, reference_image=None) -> dict:
     """Submit + poll one segment, with retries on transient failures AND
     safety-filter false positives.
+
+    If reference_image is provided (a genai_types.Image), it is passed to
+    Veo as a "ingredients to video" asset reference to anchor character
+    appearance across independently generated clips.
 
     Veo's safety filter (rai_media_filtered_count > 0) is inconsistent — the
     same prompt may pass on a second or third attempt. We retry up to
@@ -233,9 +303,11 @@ def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
             time.sleep(delay)
 
         try:
+            ref_imgs = [reference_image] if reference_image else None
             op_name = submit_veo_generation(
                 seg["prompt"], seg["duration"],
                 tier=tier, aspect_ratio=aspect,
+                reference_images=ref_imgs,
             )
         except Exception as e:
             last_error = f"submit failed: {e}"

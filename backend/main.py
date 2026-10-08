@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from database import SessionLocal, init_db
-from routes import auth_router, clients_router, projects_router, albert_router, payments_router, render_router, profile_router
+from routes import auth_router, clients_router, projects_router, albert_router, payments_router, render_router, assemble_router, profile_router
 from models import User, Client
 
 
@@ -91,12 +91,17 @@ app.include_router(albert_router)
 app.include_router(profile_router)
 app.include_router(payments_router)
 app.include_router(render_router)
+app.include_router(assemble_router)
 
-from services.storage import generated_dir
+from services.storage import generated_dir, assembled_dir
 
 _generated_dir = generated_dir()
+_assembled_dir = assembled_dir()
 print(f"[startup] {os.path.basename(__file__)}: generated dir = {_generated_dir}")
+print(f"[startup] {os.path.basename(__file__)}: assembled dir = {_assembled_dir}")
 app.mount("/generated", StaticFiles(directory=str(_generated_dir)), name="generated")
+# Finished, joined videos — kept separate from the raw segments above.
+app.mount("/assembled", StaticFiles(directory=str(_assembled_dir)), name="assembled")
 
 
 @app.get("/api/health")

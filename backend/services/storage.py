@@ -16,14 +16,29 @@ import os
 from pathlib import Path
 
 _DEFAULT_DIR = Path(__file__).resolve().parent.parent / "generated"
+_DEFAULT_ASSEMBLED = Path(__file__).resolve().parent.parent / "assembled"
 
 _ENV_VAR = "VBB_GENERATED_DIR"
+_ENV_ASSEMBLED = "VBB_ASSEMBLED_DIR"
 
 
 def generated_dir() -> Path:
     """Return the directory rendered clips are stored in, creating it if needed."""
     configured = os.getenv(_ENV_VAR, "").strip()
     path = Path(configured).expanduser() if configured else _DEFAULT_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def assembled_dir() -> Path:
+    """Directory for joined, platform-ready videos.
+
+    Kept separate from the individual segments so it is obvious which files are
+    finished deliverables (safe to upload / archive) and which are intermediates
+    that can be regenerated.
+    """
+    configured = os.getenv(_ENV_ASSEMBLED, "").strip()
+    path = Path(configured).expanduser() if configured else _DEFAULT_ASSEMBLED
     path.mkdir(parents=True, exist_ok=True)
     return path
 

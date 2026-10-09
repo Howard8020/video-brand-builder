@@ -23,29 +23,17 @@ else
 fi
 
 # ── Database tables (idempotent) ─────────────────────────────────
-echo "Creating database tables..."
-python -c "
-from database import engine, Base
-from models import User, Client, Project
-from models.credit import CreditBalance
-import sqlalchemy as sa
-
-# Create any missing tables
-Base.metadata.create_all(bind=engine)
-
-# Add brand_profile column if missing (existing tables aren't altered by create_all)
-inspector = sa.inspect(engine)
-cols = [c['name'] for c in inspector.get_columns('users')]
-if 'brand_profile' not in cols:
-    with engine.connect() as conn:
-        conn.execute(sa.text('ALTER TABLE users ADD COLUMN brand_profile JSON'))
-        conn.commit()
-    print('Added brand_profile column to users table')
-else:
-    print('brand_profile column already exists')
-
-print('Tables created/verified OK')
-"
+echo "Running database migrations..."
+# Stamp current revision (creates alembic_version table if missing
+# for databases that were created by the old create_all pattern)
+alembic stamp 95445ac45e04
+alembic upgrade head
+if [ $? -eq 0 ]; then
+    echo "Migrations applied OK"
+else
+    echo "ERROR: alembic upgrade head failed"
+    exit 1
+fi
 
 # ── Start server ─────────────────────────────────────────────────
 echo "Starting FastAPI server..."

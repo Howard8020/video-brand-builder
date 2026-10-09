@@ -27,6 +27,7 @@ from models import User
 from services.prompts import assemble_prompts, seg_cap
 from services.vertex_veo import submit_veo_generation, _get_client
 from services.assembly import assemble, ffmpeg_available
+from services.post_burn import post_burn
 from services.storage import assembled_dir, generated_dir
 from services.ratelimit import check_render_rate_limit, check_render_concurrency
 
@@ -220,9 +221,21 @@ def _run_job(job_id: str, request: RenderDirectRequest, user_id: str):
                     job_id, i, seg.get("name", "?"), word_count, duration, cap,
                 )
 
+            # Closure to store the Veo operation name on this segment result
+            # so the reconciler can poll it later if the thread hangs.
+            def _store_op_name(op_name, seg_idx=i):
+                with _jobs_lock:
+                    job = _jobs.get(job_id)
+                    if job:
+                        for r in job.get("segment_results", []):
+                            if r["index"] == seg_idx:
+                                r["veo_operation_name"] = op_name
+                                break
+
             dest = gen_dir / f"rd_{job_id}_seg{i}.mp4"
             result = _render_one_segment(seg, dest, tier, aspect, max_retries=3,
-                                          reference_image=ref_img)
+                                          reference_image=ref_img,
+                                          on_submit=_store_op_name)
 
             if result.get("ok"):
                 seg_paths.append(dest)
@@ -247,9 +260,29 @@ def _run_job(job_id: str, request: RenderDirectRequest, user_id: str):
         out_dir = assembled_dir()
         out_name = f"rd_{job_id}.mp4"
         out_path = out_dir / out_name
+        branded_name = f"rd_{job_id}_BRANDED.mp4"
+        branded_path = out_dir / branded_name
 
         info = assemble(seg_paths, out_path)
-        video_url = f"/assembled/{out_name}"
+
+        # Post-burn: overlay on-screen text labels and lower-third branding
+        brand_name = brief.get("clientName", "")
+        tagline = brief.get("serviceLine", "")
+        burn_segments = [
+            {"on_screen_text": s.get("on_screen_text", ""), "duration": s.get("duration", 8)}
+            for s in scenes
+        ]
+        try:
+            post_burn(out_path, branded_path, burn_segments, brand_name, tagline)
+            video_url = f"/assembled/{branded_name}"
+            logger.info("render-direct %s: post-burn succeeded -> %s", job_id, branded_name)
+        except Exception as burn_err:
+            logger.warning(
+                "render-direct %s: post-burn failed (%s), falling back to unbranded",
+                job_id, burn_err,
+            )
+            video_url = f"/assembled/{out_name}"
+
         _set_status(job_id, "done",
                     video_url=video_url,
                     segments_done=len(seg_paths),
@@ -276,7 +309,8 @@ def _update_seg_result(job_id: str, seg_index: int, status: str, error: str | No
 
 
 def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
-                         max_retries: int = 3, reference_image=None) -> dict:
+                         max_retries: int = 3, reference_image=None,
+                         on_submit=None) -> dict:
     """Submit + poll one segment, with retries on transient failures AND
     safety-filter false positives.
 
@@ -309,6 +343,11 @@ def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
                 tier=tier, aspect_ratio=aspect,
                 reference_images=ref_imgs,
             )
+            if on_submit:
+                try:
+                    on_submit(op_name)
+                except Exception:
+                    pass  # best-effort, never block the render
         except Exception as e:
             last_error = f"submit failed: {e}"
             if attempt < max_retries:
@@ -382,6 +421,156 @@ def _set_status(job_id: str, status: str, **kwargs):
     with _jobs_lock:
         if job_id in _jobs:
             _jobs[job_id].update({"status": status, **kwargs})
+
+
+# --- Stuck-job reconciler ---
+
+def _reconcile_stuck_jobs():
+    """Background daemon thread: scan for rendering jobs stuck >30 min.
+
+    Runs every 60 seconds. For each job with status 'rendering' whose
+    created_at timestamp is more than 30 minutes old, polls the Veo
+    operation for each rendering segment. If the Veo operation is done
+    and failed, marks the segment as failed, refunds credits, and
+    transitions the job to 'failed' if all segments have failed.
+    Leaves still-running operations alone.
+    """
+    while True:
+        time.sleep(60)
+        now = time.time()
+        threshold = now - 1800  # 30 minutes in seconds
+
+        with _jobs_lock:
+            candidates = [
+                jid for jid, j in _jobs.items()
+                if j.get("status") == "rendering"
+                and j.get("created_at", 0) < threshold
+            ]
+
+        for job_id in candidates:
+            _reconcile_one_job(job_id)
+
+
+def _reconcile_one_job(job_id: str):
+    """Poll all rendering segments of one stuck job. Returns True if job was
+    reconciled to a terminal state, False if it's still running."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or job.get("status") != "rendering":
+            return
+        seg_results = job.get("segment_results", [])
+        user_id = job.get("user_id")
+        tier = job.get("tier")
+
+    all_failed = True
+    any_still_rendering = False
+
+    for seg in seg_results:
+        if seg.get("status") != "rendering":
+            if seg.get("status") in ("failed", "pending"):
+                continue
+            if seg.get("status") == "succeeded":
+                all_failed = False
+            continue
+
+        op_name = seg.get("veo_operation_name")
+        if not op_name:
+            # No operation record — can't poll, mark failed
+            seg["status"] = "failed"
+            seg["error"] = "Stuck — no Veo operation record"
+            _refund_credits_for_job(user_id, tier)
+            logger.warning(
+                "reconciler: %s seg %d — no operation name, marked failed",
+                job_id, seg.get("index"),
+            )
+            continue
+
+        try:
+            from services.vertex_veo import poll_veo_operation
+            result = poll_veo_operation(op_name, timeout_seconds=30)
+        except Exception as e:
+            logger.warning(
+                "reconciler: poll failed for %s seg %d: %s",
+                job_id, seg.get("index"), e,
+            )
+            any_still_rendering = True
+            continue
+
+        if result.get("done"):
+            if result.get("status") == "failed":
+                seg["status"] = "failed"
+                seg["error"] = result.get("error", "Veo generation failed (reconciled)")
+                _refund_credits_for_job(user_id, tier)
+                logger.info(
+                    "reconciler: %s seg %d — Veo operation failed: %s",
+                    job_id, seg.get("index"), seg["error"],
+                )
+            elif result.get("status") == "succeeded":
+                all_failed = False
+                logger.info(
+                    "reconciler: %s seg %d — Veo operation completed, updating",
+                    job_id, seg.get("index"),
+                )
+            # else done with unknown status — treat as failed
+            else:
+                seg["status"] = "failed"
+                seg["error"] = result.get("error", "Veo operation finished with unknown status")
+                _refund_credits_for_job(user_id, tier)
+        else:
+            # Still running — leave it
+            all_failed = False
+            any_still_rendering = True
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        results = job.get("segment_results", [])
+        failed_count = sum(1 for r in results if r["status"] == "failed")
+        job["segments_failed"] = failed_count
+
+        if failed_count == len(results):
+            job["status"] = "failed"
+            job["error"] = f"All {failed_count} segments failed (reconciled)"
+            logger.info("reconciler: job %s marked failed (%d segments)", job_id, failed_count)
+        elif any_still_rendering:
+            logger.info(
+                "reconciler: job %s still has rendering segments — leaving",
+                job_id,
+            )
+
+
+def _refund_credits_for_job(user_id, tier):
+    """Refund credits for a failed job. Creates its own DB session."""
+    if not user_id or not tier:
+        return
+    try:
+        from database import SessionLocal
+        from services.billing import refund_credits
+        db = SessionLocal()
+        try:
+            refund_credits(user_id, tier, db)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("reconciler: credit refund failed for user %s: %s", user_id, e)
+
+
+_reconciler_started = False
+
+
+def _start_reconciler():
+    """Start the stuck-job reconciler daemon thread once at module load."""
+    global _reconciler_started
+    if _reconciler_started:
+        return
+    _reconciler_started = True
+    thread = threading.Thread(target=_reconcile_stuck_jobs, daemon=True)
+    thread.start()
+    logger.info("Reconciler background thread started")
+
+
+_start_reconciler()
 
 
 # --- Routes ---

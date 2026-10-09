@@ -12,3 +12,4 @@ google-cloud-aiplatform>=1.70
 stripe>=7.0
 psycopg2-binary>=2.9
 psycopg[binary]>=3.2.3
+alembic>=1.13,<2.0

@@ -183,16 +183,26 @@ creative work.**
 ### Spoken dialogue word limits
 
 Veo generates audio that matches the dialogue. If the line is too long for the
-clip duration, it will rush, truncate, or drift. At 125 words per minute:
+clip duration, it will rush, truncate, or drift. If the line is too **short**
+for the clip duration, Veo fills the dead air with **invented speech
+(gibberish)** — the model can't leave silence, so it makes up words. At 150
+words per minute:
 
-| Duration | Max words | Example |
-|----------|-----------|---------|
-| 4s | ~8 | "Matching shirts nobody else has?" |
-| 6s | ~12 | "Just tell me what you picture. One sentence is plenty." |
-| 8s | ~16 | "I'll ask a couple of quick questions. Then you check the design outline and change anything." |
+| Duration | Max words | Min words | Example |
+|----------|-----------|-----------|---------|
+| 4s | ~10 | 4-5 | "Matching shirts nobody else has?" |
+| 6s | ~15 | 8-10 | "Just tell me what you picture. One sentence." |
+| 8s | ~20 | 12-15 | "I'll ask a couple of quick questions. Then you check the design outline and change anything." |
+
+**Match the clip length to the line.** If a line has only 5 words, use a 4s
+clip — not an 8s clip. Short lines in long clips cause invented speech.
 
 **Keep it short.** If you're not sure, cut words. Shorter lines produce clearer
 audio. One speaker per clip — don't put two people's dialogue in one scene.
+
+**The system already instructs Veo not to add extra speech** beyond the
+scripted dialogue, but the most reliable fix is matching clip duration to
+line length — don't rely on the instruction alone.
 
 ### On-screen text rules
 

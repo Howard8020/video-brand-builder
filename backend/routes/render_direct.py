@@ -36,36 +36,41 @@ router = APIRouter(prefix="/api/render-direct", tags=["render-direct"])
 
 _BYPASS = "VBB_RENDER_BYPASS_CREDITS"
 
-# Reference image for character consistency. Loaded once and cached.
-# The Amy reference image was generated via FAL.ai and committed to the repo
-# at backend/assets/amy-apple-blossom-reference.png. Override with
-# VBB_REFERENCE_IMAGE env var for a custom path.
+# Reference images for character + setting consistency. Loaded once and cached.
+# The Amy reference image anchors the spokesperson's appearance across all clips.
+# The loft setting image anchors the environment (white-brick loft, golden-hour
+# light, apple blossoms) so it doesn't drift between independently generated clips.
+# Veo supports up to 3 reference images as "ingredients to video" assets.
 _REF_IMAGE_PATH = os.getenv(
     "VBB_REFERENCE_IMAGE",
     str(Path(__file__).resolve().parent.parent / "assets" / "amy-apple-blossom-reference.png"),
 )
+_SETTING_IMAGE_PATH = os.getenv(
+    "VBB_SETTING_IMAGE",
+    str(Path(__file__).resolve().parent.parent / "assets" / "loft-setting-reference.png"),
+)
 _ref_image = None
+_setting_image = None
 _ref_image_lock = threading.Lock()
 
 
-def _load_reference_image():
-    """Load and cache the spokesperson reference image for Veo.
+def _load_image(path: str, cache_attr: str) -> Any:
+    """Load and cache a reference image as a genai_types.Image.
 
-    Returns a genai_types.Image or None if no reference image is configured.
-    The image anchors the character's appearance across all independently
-    generated clips.
+    Returns None if the file doesn't exist or fails to load.
     """
-    global _ref_image
-    if _ref_image is not None:
-        return _ref_image
-    if not _REF_IMAGE_PATH or not os.path.exists(_REF_IMAGE_PATH):
-        logger.info("No reference image configured (VBB_REFERENCE_IMAGE=%s)", _REF_IMAGE_PATH)
+    globals_dict = globals()
+    cached = globals_dict.get(cache_attr)
+    if cached is not None:
+        return cached
+    if not path or not os.path.exists(path):
+        logger.info("Image not found (%s=%s)", cache_attr, path)
         return None
     try:
         from PIL import Image as PILImage
         import io
         from google.genai import types as genai_types
-        img = PILImage.open(_REF_IMAGE_PATH)
+        img = PILImage.open(path)
         if img.mode != "RGB":
             img = img.convert("RGB")
         max_dim = 1024
@@ -75,12 +80,24 @@ def _load_reference_image():
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         with _ref_image_lock:
-            _ref_image = genai_types.Image(image_bytes=buf.getvalue(), mime_type="image/png")
-        logger.info("Loaded reference image: %s", _REF_IMAGE_PATH)
-        return _ref_image
+            globals()[cache_attr] = genai_types.Image(
+                image_bytes=buf.getvalue(), mime_type="image/png"
+            )
+        logger.info("Loaded %s: %s", cache_attr, path)
+        return globals()[cache_attr]
     except Exception as e:
-        logger.warning("Could not load reference image %s: %s", _REF_IMAGE_PATH, e)
+        logger.warning("Could not load %s %s: %s", cache_attr, path, e)
         return None
+
+
+def _load_reference_image():
+    """Load the spokesperson reference image for character consistency."""
+    return _load_image(_REF_IMAGE_PATH, "_ref_image")
+
+
+def _load_setting_image():
+    """Load the setting reference image for environment consistency."""
+    return _load_image(_SETTING_IMAGE_PATH, "_setting_image")
 
 
 def get_db():
@@ -198,10 +215,15 @@ def _run_job(job_id: str, request: RenderDirectRequest, user_id: str):
             })
         _set_status(job_id, "rendering", segment_results=seg_results)
 
-        # Load reference image for character consistency
+        # Load reference images for character + setting consistency.
+        # Veo supports up to 3 reference images as "ingredients to video"
+        # assets. We pass Amy's portrait (character) and the loft (setting)
+        # so both the person and the environment stay consistent across clips.
         ref_img = _load_reference_image()
+        setting_img = _load_setting_image()
+        ref_imgs = [img for img in [ref_img, setting_img] if img is not None] or None
 
-        wpm = settings.get("wpm", 125)
+        wpm = settings.get("wpm", 150)
 
         for i, seg in enumerate(segs, 1):
             _set_status(job_id, "rendering", segments_done=i - 1)
@@ -234,7 +256,7 @@ def _run_job(job_id: str, request: RenderDirectRequest, user_id: str):
 
             dest = gen_dir / f"rd_{job_id}_seg{i}.mp4"
             result = _render_one_segment(seg, dest, tier, aspect, max_retries=3,
-                                          reference_image=ref_img,
+                                          reference_images=ref_imgs,
                                           on_submit=_store_op_name)
 
             if result.get("ok"):
@@ -309,14 +331,15 @@ def _update_seg_result(job_id: str, seg_index: int, status: str, error: str | No
 
 
 def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
-                         max_retries: int = 3, reference_image=None,
+                         max_retries: int = 3, reference_images=None,
                          on_submit=None) -> dict:
     """Submit + poll one segment, with retries on transient failures AND
     safety-filter false positives.
 
-    If reference_image is provided (a genai_types.Image), it is passed to
-    Veo as a "ingredients to video" asset reference to anchor character
-    appearance across independently generated clips.
+    If reference_images is provided (a list of genai_types.Image), they are
+    passed to Veo as "ingredients to video" asset references to anchor
+    character + setting appearance across independently generated clips.
+    Veo supports up to 3 reference images.
 
     Veo's safety filter (rai_media_filtered_count > 0) is inconsistent — the
     same prompt may pass on a second or third attempt. We retry up to
@@ -337,11 +360,10 @@ def _render_one_segment(seg: dict, dest: Path, tier: str, aspect: str,
             time.sleep(delay)
 
         try:
-            ref_imgs = [reference_image] if reference_image else None
             op_name = submit_veo_generation(
                 seg["prompt"], seg["duration"],
                 tier=tier, aspect_ratio=aspect,
-                reference_images=ref_imgs,
+                reference_images=reference_images,
             )
             if on_submit:
                 try:

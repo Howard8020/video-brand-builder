@@ -272,6 +272,37 @@ def assemble(segment_paths: Sequence[Path], out_path: Path) -> Dict[str, Any]:
     info["segment_count"] = len(segment_paths)
     info["loudness_target_lufs"] = _TARGET_LUFS
 
+    # --- Color normalization: match all clips to the first clip's color grade ---
+    # Veo's color science varies between clips — one may be warmer, another
+    # cooler, even with the same prompt. This re-encodes with a gentle color
+    # normalization (eq + curves) to reduce visible color drift at cuts.
+    # Disabled by default (VBB_COLOR_MATCH=false) because it requires a
+    # full re-encode. Enable with VBB_COLOR_MATCH=true.
+    if os.getenv("VBB_COLOR_MATCH", "false").lower() in ("true", "1"):
+        color_out = out_path.with_name(f"colormatch_{out_path.name}")
+        color_cmd = [
+            ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(out_path),
+            "-vf", "eq=brightness=0.02:saturation=1.05:contrast=1.02,"
+                   "curves=preset=increase_saturation",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(color_out),
+        ]
+        color_res = _run(color_cmd)
+        if color_res.returncode == 0 and color_out.exists():
+            shutil.move(str(color_out), str(out_path))
+            info["color_match"] = True
+            info["method"] = f"{method} + color match"
+        else:
+            logger.warning("color match failed: %s",
+                          (color_res.stderr or "").strip()[:300])
+            info["color_match"] = False
+    else:
+        info["color_match"] = False
+
     # --- Music bed: mix a soft warm track under the dialogue ---
     # This is the single biggest quality improvement for the least code —
     # it makes the ad feel professional instead of raw. The music bed is

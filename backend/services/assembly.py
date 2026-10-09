@@ -111,24 +111,40 @@ def probe(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _trim_segment(in_path: Path, out_path: Path, trim_start: float = 0.3,
-                   trim_end: float = 0.3) -> bool:
+def _trim_segment(in_path: Path, out_path: Path, trim_start: float = 0.0,
+                   trim_end: float = 0.0) -> bool:
     """Trim silence/freeze-frame from the start and end of a Veo clip.
 
-    Veo clips typically have ~0.3-0.5s of silence or a freeze-frame at the
-    beginning and end. Trimming these makes clip-to-clip transitions tighter
-    when the clips are concatenated.
+    Veo clips may have silence or a freeze-frame at the beginning and end.
+    Trimming these makes clip-to-clip transitions tighter when the clips are
+    concatenated.
+
+    IMPORTANT: stream-copy (-c copy) with -ss seeking past the first keyframe
+    produces a corrupted file (invalid NAL units, missing pictures). Veo clips
+    have keyframes only at the start, so any seek > 0s with stream-copy breaks
+    the H.264 stream. We must re-encode the video when trimming.
 
     Returns True on success, False if trimming failed (caller should use
     the original untrimmed file as a fallback).
     """
+    if trim_start <= 0 and trim_end <= 0:
+        return False  # nothing to trim
+
+    duration = _probe_duration(in_path)
+    target_duration = duration - trim_start - trim_end
+    if target_duration < 0.5:
+        return False  # would trim away almost the entire clip
+
+    # Re-encode video (not stream-copy) because seeking past the first
+    # keyframe with -c copy corrupts the H.264 stream.
     cmd = [
         ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
         "-ss", str(trim_start),
         "-i", str(in_path),
-        "-t", str(max(0.1, _probe_duration(in_path) - trim_start - trim_end)),
-        "-c:v", "copy",
-        "-c:a", "copy",
+        "-t", str(target_duration),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -181,18 +197,21 @@ def assemble(segment_paths: Sequence[Path], out_path: Path) -> Dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="vbb_assemble_") as tmp:
         # Trim silence/freeze-frame from clip boundaries for tighter transitions.
-        # Veo clips have ~0.3-0.5s of silence at the start and end; trimming
-        # makes the cut between clips feel snappy instead of laggy.
+        # Disabled by default (trim_amount=0) because the re-encode adds processing
+        # time and the transition tightness gain is marginal for most Veo clips.
+        # Enable by setting VBB_TRIM_AMOUNT env var (e.g. "0.3" for 0.3s each end).
+        trim_amount = float(os.getenv("VBB_TRIM_AMOUNT", "0"))
         trimmed_paths = []
-        trim_failed = False
         for p in segment_paths:
             src = Path(p)
-            trimmed = Path(tmp) / f"trimmed_{src.name}"
-            if _trim_segment(src, trimmed, trim_start=0.3, trim_end=0.3):
-                trimmed_paths.append(trimmed)
+            if trim_amount > 0:
+                trimmed = Path(tmp) / f"trimmed_{src.name}"
+                if _trim_segment(src, trimmed, trim_start=trim_amount, trim_end=trim_amount):
+                    trimmed_paths.append(trimmed)
+                else:
+                    logger.warning("using untrimmed segment: %s", src.name)
+                    trimmed_paths.append(src)
             else:
-                # Fallback: use the original untrimmed file
-                logger.warning("using untrimmed segment: %s", src.name)
                 trimmed_paths.append(src)
 
         list_file = Path(tmp) / "segments.txt"

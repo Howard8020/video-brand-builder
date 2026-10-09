@@ -36,6 +36,15 @@ _TARGET_LUFS = os.getenv("VBB_LOUDNESS_TARGET", "-14")
 _TRUE_PEAK = "-1.5"
 _LOUDNESS_RANGE = "11"
 
+# Music bed: a soft, warm background track mixed under the dialogue at a
+# low volume so it adds warmth without competing with speech.
+_MUSIC_BED_PATH = os.getenv(
+    "VBB_MUSIC_BED",
+    str(Path(__file__).resolve().parent.parent / "assets" / "music" / "warm-bed.mp3"),
+)
+_MUSIC_BED_VOLUME = float(os.getenv("VBB_MUSIC_BED_VOLUME", "0.08"))  # -22 dB approx
+_MUSIC_BED_FADE = float(os.getenv("VBB_MUSIC_BED_FADE", "1.5"))  # seconds
+
 _FFMPEG_TIMEOUT = 600  # seconds; concatenation is stream-copy so normally seconds
 
 
@@ -222,11 +231,14 @@ def assemble(segment_paths: Sequence[Path], out_path: Path) -> Dict[str, Any]:
 
         # Preferred path: copy the video stream (lossless, fast) and re-encode
         # only the audio so loudness can be normalised.
+        # Also add a 0.15s audio fade-in/out at each clip boundary so the
+        # hard cut between clips doesn't produce an audible click or pop.
         copy_cmd = [
             ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
             "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:v", "copy",
-            "-af", f"loudnorm=I={_TARGET_LUFS}:TP={_TRUE_PEAK}:LRA={_LOUDNESS_RANGE}",
+            "-af", f"loudnorm=I={_TARGET_LUFS}:TP={_TRUE_PEAK}:LRA={_LOUDNESS_RANGE},"
+                   f"afade=t=in:st=0:d=0.15,afade=t=out:st={max(0,info.get('duration',40)-0.15):.2f}:d=0.15",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",
             str(out_path),
@@ -259,6 +271,46 @@ def assemble(segment_paths: Sequence[Path], out_path: Path) -> Dict[str, Any]:
     info["method"] = method
     info["segment_count"] = len(segment_paths)
     info["loudness_target_lufs"] = _TARGET_LUFS
+
+    # --- Music bed: mix a soft warm track under the dialogue ---
+    # This is the single biggest quality improvement for the least code —
+    # it makes the ad feel professional instead of raw. The music bed is
+    # mixed at a low volume (-22 dB) so it adds warmth without competing
+    # with speech. Fade in at the start and fade out at the end.
+    music_path = Path(_MUSIC_BED_PATH)
+    if music_path.exists() and _MUSIC_BED_VOLUME > 0:
+        music_out = out_path.with_name(f"with_music_{out_path.name}")
+        total_dur = info.get("duration", 40.0)
+        fade = _MUSIC_BED_FADE
+
+        music_cmd = [
+            ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(out_path),
+            "-i", str(music_path),
+            "-filter_complex",
+            f"[1:a]aloop=loop=-1:size=999999,volume={_MUSIC_BED_VOLUME},"
+            f"afade=t=in:st=0:d={fade},afade=t=out:st={max(0,total_dur-fade)}:d={fade}[music];"
+            f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-movflags", "+faststart",
+            "-t", str(total_dur),
+            str(music_out),
+        ]
+        music_res = _run(music_cmd)
+        if music_res.returncode == 0 and music_out.exists():
+            # Replace the original with the music version
+            shutil.move(str(music_out), str(out_path))
+            info["music_bed"] = True
+            info["method"] = f"{method} + music bed"
+        else:
+            logger.warning("music bed mix failed: %s",
+                          (music_res.stderr or "").strip()[:300])
+            info["music_bed"] = False
+    else:
+        info["music_bed"] = False
+
     logger.info("assembled %d segments -> %s (%ss, %s)",
-                len(segment_paths), out_path.name, info.get("duration"), method)
+                len(segment_paths), out_path.name, info.get("duration"), info.get("method"))
     return info

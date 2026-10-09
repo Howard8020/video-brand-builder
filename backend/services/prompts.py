@@ -4,7 +4,9 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
-DEFAULT_WPM = 125
+DEFAULT_WPM = 150  # Raised from 125 — tighter word caps mean less dead air
+                     # for Veo to fill with invented speech. At 150 WPM, an
+                     # 8s clip holds ~20 words; a 4s clip holds ~10.
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = os.environ.get("VBB_ANTHROPIC_MODEL", "claude-sonnet-4-6")
 _k = "VBB_ANTHROPIC_API_KEY"
@@ -292,6 +294,7 @@ def assemble_flow_prompt(seg, i, project):
     lines.append("{} — {} says, with {} delivery:".format(label, spokesperson.split(",")[0].strip(), delivery.split(",")[0].strip()))
     lines.append('"{}"'.format(spoken))
     lines.append("Generate clear, audible speech with synchronized lip movement matching this dialogue exactly.")
+    lines.append("Do NOT add any extra speech, narration, or dialogue beyond the words above. Do not fill silence with made-up words. If the scripted line ends before the clip ends, hold the final expression in silence — do not invent additional speech.")
     # On-screen text is NOT sent to Veo — it reliably garbles even short text.
     # All on-screen text is burned in post with ffmpeg drawtext after assembly.
     # The on_screen_text field is preserved in the segment data for the post step.
@@ -300,7 +303,7 @@ def assemble_flow_prompt(seg, i, project):
     lines.append("Continuity — identical in every segment of this ad:")
     lines.append(cont_text)
     lines.append("")
-    avoid = " Avoid: Do not change or misspell the brand name \"{}\". Do not add extra spoken words beyond the dialogue.{} Do not invent prices, offers, or claims.{}".format(brief.get("clientName"), " Do not show an on-camera spokesperson." if mode == "product" else "", (" Never include: {}".format(project.get("avoid")) if project.get("avoid") else ""))
+    avoid = " Avoid: Do not change or misspell the brand name \"{}\". Do not add extra spoken words beyond the dialogue. Do not invent speech, narration, or dialogue to fill silence.{} Do not invent prices, offers, or claims.{}".format(brief.get("clientName"), " Do not show an on-camera spokesperson." if mode == "product" else "", (" Never include: {}".format(project.get("avoid")) if project.get("avoid") else ""))
     lines.append(avoid)
     return "\n".join(lines)
 

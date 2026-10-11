@@ -233,12 +233,16 @@ def assemble(segment_paths: Sequence[Path], out_path: Path) -> Dict[str, Any]:
         # only the audio so loudness can be normalised.
         # Also add a 0.15s audio fade-in/out at each clip boundary so the
         # hard cut between clips doesn't produce an audible click or pop.
+        # Compute total duration from segments for the fade-out timestamp
+        # (info dict isn't available yet — it's assigned after probe).
+        _total_dur = sum(_probe_duration(Path(p)) for p in trimmed_paths)
+        _fade_out_st = max(0, _total_dur - 0.15)
         copy_cmd = [
             ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
             "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-c:v", "copy",
             "-af", f"loudnorm=I={_TARGET_LUFS}:TP={_TRUE_PEAK}:LRA={_LOUDNESS_RANGE},"
-                   f"afade=t=in:st=0:d=0.15,afade=t=out:st={max(0,info.get('duration',40)-0.15):.2f}:d=0.15",
+                   f"afade=t=in:st=0:d=0.15,afade=t=out:st={_fade_out_st:.2f}:d=0.15",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",
             str(out_path),

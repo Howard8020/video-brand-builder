@@ -323,9 +323,12 @@ def assemble(segment_paths: Sequence[Path], out_path: Path) -> Dict[str, Any]:
             "-i", str(out_path),
             "-i", str(music_path),
             "-filter_complex",
+            # Use 'amix' with weights to keep dialogue at full volume
+            # while the music bed stays low. Without weights, amix
+            # averages the inputs, which halves the dialogue volume.
             f"[1:a]aloop=loop=-1:size=999999,volume={_MUSIC_BED_VOLUME},"
             f"afade=t=in:st=0:d={fade},afade=t=out:st={max(0,total_dur-fade)}:d={fade}[music];"
-            f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+            f"[0:a][music]amix=inputs=2:duration=first:weights=1 0.3:dropout_transition=0[aout]",
             "-map", "0:v", "-map", "[aout]",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
